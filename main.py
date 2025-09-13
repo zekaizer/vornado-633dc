@@ -25,6 +25,64 @@ POTENTIOMETER_THRESHOLD = int(65535/100)
 
 # MQTT topics are now managed inside MqttManager class
 
+class CircuitBreaker:
+    """
+    Circuit Breaker pattern implementation for fault tolerance.
+    States: CLOSED (normal) -> OPEN (fault) -> HALF_OPEN (testing)
+    """
+    def __init__(self, failure_threshold=3, recovery_timeout=60):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.failure_count = 0
+        self.last_failure_time = 0
+        self.state = "closed"  # closed, open, half_open
+
+    async def call(self, func, *args, **kwargs):
+        """Execute function through circuit breaker"""
+        if self.state == "open":
+            if self._should_attempt_reset():
+                self.state = "half_open"
+                print(f"Circuit breaker transitioning to HALF_OPEN")
+            else:
+                raise Exception("Circuit breaker is OPEN")
+
+        try:
+            result = await func(*args, **kwargs)
+            self._on_success()
+            return result
+        except Exception as e:
+            self._on_failure()
+            raise e
+
+    def _on_success(self):
+        """Handle successful execution"""
+        if self.state == "half_open":
+            print(f"Circuit breaker recovered, transitioning to CLOSED")
+        self.failure_count = 0
+        self.state = "closed"
+
+    def _on_failure(self):
+        """Handle failed execution"""
+        self.failure_count += 1
+        self.last_failure_time = time.monotonic()
+
+        if self.failure_count >= self.failure_threshold:
+            if self.state != "open":
+                print(f"Circuit breaker OPENED after {self.failure_count} failures")
+            self.state = "open"
+
+    def _should_attempt_reset(self):
+        """Check if enough time has passed to attempt reset"""
+        return (time.monotonic() - self.last_failure_time) >= self.recovery_timeout
+
+    def get_state(self):
+        """Get current circuit breaker state"""
+        return {
+            "state": self.state,
+            "failure_count": self.failure_count,
+            "time_since_failure": time.monotonic() - self.last_failure_time if self.last_failure_time > 0 else 0
+        }
+
 class BaseConnectionManager:
     def __init__(self, connection_type, max_retries=5, base_delay=1.0, max_delay=60.0):
         self.connection_type = connection_type
@@ -33,6 +91,12 @@ class BaseConnectionManager:
         self.max_delay = max_delay
         self.retry_count = 0
         self.last_retry_time = 0
+
+        # Circuit breaker for connection protection
+        self.circuit_breaker = CircuitBreaker(
+            failure_threshold=3,
+            recovery_timeout=60
+        )
 
     def reset_retries(self):
         self.retry_count = 0
@@ -68,15 +132,35 @@ class BaseConnectionManager:
     async def connect_with_retry(self, connect_func, *args, **kwargs):
         while True:
             try:
-                result = await connect_func(*args, **kwargs)
+                # Check circuit breaker state before attempting connection
+                cb_state = self.circuit_breaker.get_state()
+                if cb_state["state"] == "open":
+                    print(f"{self.connection_type} circuit breaker is OPEN, skipping connection attempt")
+                    await asyncio.sleep(min(cb_state["time_since_failure"], self.max_delay))
+                    continue
+
+                # Attempt connection through circuit breaker
+                result = await self.circuit_breaker.call(connect_func, *args, **kwargs)
+
                 if result:
                     print(f"{self.connection_type} connected successfully")
                     self.reset_retries()
                     return True
+                else:
+                    # Connection function returned False
+                    raise Exception(f"{self.connection_type} connection returned False")
+
             except Exception as e:
                 print(f"{self.connection_type} connection failed: {e}")
 
             await self.wait_before_retry()
+
+    def get_circuit_breaker_info(self):
+        """Get circuit breaker status information"""
+        cb_state = self.circuit_breaker.get_state()
+        return f"{self.connection_type} Circuit Breaker: {cb_state['state'].upper()} " \
+               f"(failures: {cb_state['failure_count']}, " \
+               f"time since failure: {cb_state['time_since_failure']:.1f}s)"
 
 class WiFiConnectionManager(BaseConnectionManager):
     def __init__(self, max_retries=5, base_delay=1.0, max_delay=60.0):
@@ -272,6 +356,11 @@ async def check_connections(wifi_manager, mqtt_manager):
     while True:
         await asyncio.sleep(WIFI_CHECK_INTERVAL_SEC)
 
+        # Log circuit breaker states periodically
+        print(f"Connection Status Check:")
+        print(f"  {wifi_manager.get_circuit_breaker_info()}")
+        print(f"  {mqtt_manager.get_circuit_breaker_info()}")
+
         # Check WiFi connection
         wifi_ok = await wifi_manager.ensure_connection()
 
@@ -284,6 +373,8 @@ async def check_connections(wifi_manager, mqtt_manager):
             except Exception as e:
                 print(f"MQTT connection check failed: {e}")
                 await mqtt_manager.connect_with_retry(mqtt_manager.reconnect_mqtt)
+        else:
+            print(f"WiFi connection failed, skipping MQTT check")
 
 async def monitor_potentiometer(mqtt_manager, pin):
     potentiometer = AnalogIn(pin)
