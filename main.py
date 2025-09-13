@@ -10,20 +10,43 @@ from analogio import AnalogIn
 import time
 import random
 
-# 상수 정의
+# Network configuration
 BOARD_NAME = os.getenv("BOARD_NAME", "DefaultBoard")
 WIFI_SSID = os.getenv('CIRCUITPY_WIFI_SSID')
 WIFI_PASSWORD = os.getenv('CIRCUITPY_WIFI_PASSWORD')
 MQTT_BROKER_IP = os.getenv("MQTT_BROKER_IP")
 MQTT_BROKER_PORT = int(os.getenv("MQTT_BROKER_PORT", "1883"))
-FAN_PIN = board.GP22
-POTENTIOMETER_PIN = board.GP28_A2
-PWM_FREQUENCY_HZ = 1000
-WIFI_CHECK_INTERVAL_SEC = 10
-POTENTIOMETER_CHECK_INTERVAL_SEC = 0.1
-POTENTIOMETER_THRESHOLD = int(65535/100)
 
-# MQTT topics are now managed inside MqttManager class
+# Hardware configuration with dynamic pin access
+def get_pin(pin_name):
+    """Get pin object from string name with error handling"""
+    if not hasattr(board, pin_name):
+        raise ValueError(f"Pin {pin_name} not found on board")
+    return getattr(board, pin_name)
+
+FAN_PIN_NAME = os.getenv("FAN_PIN", "GP22")
+FAN_PIN = get_pin(FAN_PIN_NAME)
+
+POTENTIOMETER_PIN_NAME = os.getenv("POTENTIOMETER_PIN", "GP28_A2")
+POTENTIOMETER_PIN = get_pin(POTENTIOMETER_PIN_NAME)
+
+# Timing and frequency configuration
+PWM_FREQUENCY_HZ = int(os.getenv("PWM_FREQUENCY_HZ", "1000"))
+WIFI_CHECK_INTERVAL_SEC = float(os.getenv("WIFI_CHECK_INTERVAL_SEC", "10"))
+POTENTIOMETER_CHECK_INTERVAL_SEC = float(os.getenv("POTENTIOMETER_CHECK_INTERVAL_SEC", "0.1"))
+POTENTIOMETER_THRESHOLD_PERCENT = float(os.getenv("POTENTIOMETER_THRESHOLD_PERCENT", "1"))
+POTENTIOMETER_THRESHOLD = int(65535 * POTENTIOMETER_THRESHOLD_PERCENT / 100)
+
+# Configuration validation
+print(f"Hardware Configuration:")
+print(f"  Fan Pin: {FAN_PIN_NAME} -> {FAN_PIN}")
+print(f"  Potentiometer Pin: {POTENTIOMETER_PIN_NAME} -> {POTENTIOMETER_PIN}")
+print(f"  PWM Frequency: {PWM_FREQUENCY_HZ} Hz")
+print(f"Timing Configuration:")
+print(f"  WiFi Check Interval: {WIFI_CHECK_INTERVAL_SEC}s")
+print(f"  Potentiometer Check Interval: {POTENTIOMETER_CHECK_INTERVAL_SEC}s")
+print(f"  Potentiometer Threshold: {POTENTIOMETER_THRESHOLD_PERCENT}% ({POTENTIOMETER_THRESHOLD})")
+print()
 
 class CircuitBreaker:
     """
