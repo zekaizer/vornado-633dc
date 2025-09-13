@@ -7,6 +7,8 @@ import adafruit_minimqtt.adafruit_minimqtt as MQTT
 import board
 import pwmio
 from analogio import AnalogIn
+import time
+import random
 
 # 상수 정의
 BOARD_NAME = os.getenv("BOARD_NAME", "DefaultBoard")
@@ -25,6 +27,109 @@ POTENTIOMETER_THRESHOLD = int(65535/100)
 MQTT_TOPIC_SPEED = f"{BOARD_NAME}/feeds/speed"
 MQTT_TOPIC_KNOB = f"{BOARD_NAME}/feeds/knob"
 MQTT_TOPIC_ONOFF = f"{BOARD_NAME}/feeds/onoff"
+
+class BaseConnectionManager:
+    def __init__(self, connection_type, max_retries=5, base_delay=1.0, max_delay=60.0):
+        self.connection_type = connection_type
+        self.max_retries = max_retries
+        self.base_delay = base_delay
+        self.max_delay = max_delay
+        self.retry_count = 0
+        self.last_retry_time = 0
+
+    def reset_retries(self):
+        self.retry_count = 0
+
+    def calculate_delay(self, retry_count):
+        delay = min(self.base_delay * (2 ** retry_count), self.max_delay)
+        jitter = random.uniform(0.8, 1.2)
+        return delay * jitter
+
+    def can_retry(self):
+        if self.retry_count >= self.max_retries:
+            current_time = time.monotonic()
+            if current_time - self.last_retry_time >= self.max_delay:
+                self.retry_count = 0
+                return True
+            return False
+        return True
+
+    async def wait_before_retry(self):
+        if not self.can_retry():
+            print(f"{self.connection_type} max retries ({self.max_retries}) reached. Waiting {self.max_delay}s...")
+            await asyncio.sleep(self.max_delay)
+            return
+
+        if self.retry_count > 0:
+            delay = self.calculate_delay(self.retry_count)
+            print(f"{self.connection_type} retry {self.retry_count}/{self.max_retries} in {delay:.1f}s...")
+            await asyncio.sleep(delay)
+
+        self.retry_count += 1
+        self.last_retry_time = time.monotonic()
+
+    async def connect_with_retry(self, connect_func, *args, **kwargs):
+        while True:
+            try:
+                result = await connect_func(*args, **kwargs)
+                if result:
+                    print(f"{self.connection_type} connected successfully")
+                    self.reset_retries()
+                    return True
+            except Exception as e:
+                print(f"{self.connection_type} connection failed: {e}")
+
+            await self.wait_before_retry()
+
+class WiFiConnectionManager(BaseConnectionManager):
+    def __init__(self, max_retries=5, base_delay=1.0, max_delay=60.0):
+        super().__init__("WiFi", max_retries, base_delay, max_delay)
+
+    async def connect_to_wifi(self):
+        try:
+            if not wifi.radio.connected:
+                wifi.radio.connect(WIFI_SSID, WIFI_PASSWORD)
+                while not wifi.radio.connected:
+                    await asyncio.sleep(1)
+            print("Connected to WiFi")
+            print("My IP address is", wifi.radio.ipv4_address)
+            return True
+        except Exception as e:
+            print(f"Failed to connect to WiFi: {e}")
+            return False
+
+    async def ensure_connection(self):
+        if not wifi.radio.connected:
+            print("WiFi disconnected. Reconnecting...")
+            return await self.connect_with_retry(self.connect_to_wifi)
+        return True
+
+class MqttConnectionManager(BaseConnectionManager):
+    def __init__(self, mqtt_client, max_retries=3, base_delay=2.0, max_delay=30.0):
+        super().__init__("MQTT", max_retries, base_delay, max_delay)
+        self.mqtt_client = mqtt_client
+
+    async def connect_to_mqtt(self):
+        try:
+            print(f"Connecting to {self.mqtt_client.broker}:{self.mqtt_client.port}...")
+            self.mqtt_client.connect()
+            print("Connected to MQTT broker")
+            return True
+        except Exception as e:
+            print(f"Failed to connect to MQTT broker: {e}")
+            return False
+
+    async def reconnect_mqtt(self):
+        try:
+            self.mqtt_client.reconnect()
+            print("MQTT reconnected successfully")
+            return True
+        except Exception as e:
+            print(f"Failed to reconnect MQTT: {e}")
+            return False
+
+    async def ensure_connection(self):
+        return await self.connect_with_retry(self.connect_to_mqtt)
 
 class FanController:
     def __init__(self, pin):
@@ -50,16 +155,6 @@ class FanController:
             print(f"{self.pin}: On {self.is_on}, speed {self.current_speed_percent:.1f}% -> {self.target_speed_percent:.1f}%, pwm.duty_cycle {duty_cycle}")
             self.current_speed_percent = self.target_speed_percent
 
-async def connect_to_wifi():
-    print("Connecting to WiFi")
-    try:
-        wifi.radio.connect(WIFI_SSID, WIFI_PASSWORD)
-        while not wifi.radio.connected:
-            await asyncio.sleep(1)
-        print("Connected to WiFi")
-        print("My IP address is", wifi.radio.ipv4_address)
-    except Exception as e:
-        print(f"Failed to connect to WiFi: {e}")
 
 async def run_mqtt_client_loop(mqtt_client):
     while True:
@@ -69,16 +164,22 @@ async def run_mqtt_client_loop(mqtt_client):
             print(f"MQTT loop error: {e}")
         await asyncio.sleep(0)
 
-async def check_wifi_connection(mqtt_client):
+async def check_connections(wifi_manager, mqtt_manager):
     while True:
         await asyncio.sleep(WIFI_CHECK_INTERVAL_SEC)
-        if not wifi.radio.connected:
-            print("WiFi disconnected. Reconnecting...")
-            await connect_to_wifi()
+
+        # Check WiFi connection
+        wifi_ok = await wifi_manager.ensure_connection()
+
+        # If WiFi is working, ensure MQTT connection
+        if wifi_ok:
             try:
-                mqtt_client.reconnect()
+                # Check if MQTT client needs reconnection
+                if not hasattr(mqtt_manager.mqtt_client, '_sock') or mqtt_manager.mqtt_client._sock is None:
+                    await mqtt_manager.connect_with_retry(mqtt_manager.reconnect_mqtt)
             except Exception as e:
-                print(f"Failed to reconnect MQTT: {e}")
+                print(f"MQTT connection check failed: {e}")
+                await mqtt_manager.connect_with_retry(mqtt_manager.reconnect_mqtt)
 
 async def monitor_potentiometer(mqtt_client, pin):
     potentiometer = AnalogIn(pin)
@@ -114,7 +215,11 @@ def on_mqtt_disconnect(client, userdata, rc):
     print("Disconnected from MQTT Broker!")
 
 async def main():
-    await connect_to_wifi()
+    # Create connection managers
+    wifi_manager = WiFiConnectionManager()
+
+    # Initial WiFi connection
+    await wifi_manager.ensure_connection()
 
     fan_controller = FanController(FAN_PIN)
 
@@ -131,16 +236,13 @@ async def main():
     mqtt_client.on_disconnect = on_mqtt_disconnect
     mqtt_client.on_message = on_mqtt_message
 
-    print(f"Connecting to {mqtt_client.broker}:{mqtt_client.port}...")
-    try:
-        mqtt_client.connect()
-    except Exception as e:
-        print(f"Failed to connect to MQTT broker: {e}")
-        return
+    # Create MQTT manager and initial connection
+    mqtt_manager = MqttConnectionManager(mqtt_client)
+    await mqtt_manager.ensure_connection()
 
     tasks = [
         asyncio.create_task(run_mqtt_client_loop(mqtt_client)),
-        asyncio.create_task(check_wifi_connection(mqtt_client)),
+        asyncio.create_task(check_connections(wifi_manager, mqtt_manager)),
         asyncio.create_task(monitor_potentiometer(mqtt_client, POTENTIOMETER_PIN)),
         asyncio.create_task(fan_controller.run_fan_control()),
     ]
