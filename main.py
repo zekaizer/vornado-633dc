@@ -297,6 +297,29 @@ class MqttManager(BaseConnectionManager):
             print(f"Failed to reconnect MQTT: {e}")
             return False
 
+    def is_connected(self):
+        """Check if MQTT client is connected using official API"""
+        if self.mqtt_client is None:
+            return False
+
+        try:
+            return self.mqtt_client.is_connected()
+        except Exception as e:
+            print(f"Error checking MQTT connection status: {e}")
+            return False
+
+    async def ping_broker(self):
+        """Ping MQTT broker to verify active connection"""
+        if not self.is_connected():
+            return False
+
+        try:
+            self.mqtt_client.ping()
+            return True
+        except Exception as e:
+            print(f"MQTT ping failed: {e}")
+            return False
+
     async def ensure_connection(self):
         """Ensure MQTT connection with retry"""
         return await self.connect_with_retry(self.connect_to_mqtt)
@@ -390,9 +413,16 @@ async def check_connections(wifi_manager, mqtt_manager):
         # If WiFi is working, ensure MQTT connection
         if wifi_ok:
             try:
-                # Check if MQTT client needs reconnection
-                if not hasattr(mqtt_manager.mqtt_client, '_sock') or mqtt_manager.mqtt_client._sock is None:
+                # Check MQTT connection using official API
+                if not mqtt_manager.is_connected():
+                    print("MQTT not connected, attempting reconnection...")
                     await mqtt_manager.connect_with_retry(mqtt_manager.reconnect_mqtt)
+                else:
+                    # Ping broker to verify active connection
+                    ping_ok = await mqtt_manager.ping_broker()
+                    if not ping_ok:
+                        print("MQTT ping failed, attempting reconnection...")
+                        await mqtt_manager.connect_with_retry(mqtt_manager.reconnect_mqtt)
             except Exception as e:
                 print(f"MQTT connection check failed: {e}")
                 await mqtt_manager.connect_with_retry(mqtt_manager.reconnect_mqtt)
